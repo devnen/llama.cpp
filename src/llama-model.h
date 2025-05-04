@@ -1,3 +1,4 @@
+// src/llama-model.h
 #pragma once
 
 #include "llama.h"
@@ -11,6 +12,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <map> // Added for tensor_gpu_assignment
 
 struct llama_cparams;
 struct llama_ubatch;
@@ -411,6 +413,9 @@ struct llama_model {
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    // Added for auto-balancing
+    friend struct llama_context; // Allow context to access impl details if needed
 };
 
 const char * llm_type_name(llm_type type);
@@ -418,3 +423,49 @@ const char * llm_type_name(llm_type type);
 // For internal test use
 // TODO: remove
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
+
+// lists of buffer types used for each layer
+using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
+
+// private implementation details
+struct llama_model::impl {
+    impl() {}
+    ~impl() {}
+
+    uint64_t n_elements = 0;
+
+    size_t n_bytes = 0;
+
+    std::string desc_str;
+
+    // model memory mapped files
+    llama_mmaps mappings;
+
+    // objects representing data potentially being locked in memory
+    llama_mlocks mlock_bufs;
+    llama_mlocks mlock_mmaps;
+
+    // contexts where the model tensors metadata is stored
+    std::vector<ggml_context_ptr> ctxs;
+
+    // the model memory buffers for the tensor data
+    std::vector<ggml_backend_buffer_ptr> bufs;
+
+    buft_list_t cpu_buft_list;
+    std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+
+    struct layer_dev {
+        ggml_backend_dev_t dev;
+        buft_list_t * buft_list;
+    };
+
+    layer_dev dev_input = {};
+    layer_dev dev_output = {};
+    std::vector<layer_dev> dev_layer;
+
+    bool has_tensor_overrides;
+
+    // Members for automatic balancing
+    bool auto_balance_map_ready = false;
+    std::map<std::string, int> tensor_gpu_assignment; // Maps tensor name to assigned GPU device index
+};
