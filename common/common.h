@@ -1,3 +1,4 @@
+// common/common.h
 // Various helper functions and utilities
 
 #pragma once
@@ -8,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <sstream>
+#include <map> // Added for potential use in parameter structs if needed later
 
 #ifdef _WIN32
 #define DIRECTORY_SEPARATOR '\\'
@@ -242,7 +244,8 @@ struct common_params {
 
     int32_t n_gpu_layers      = -1;  // number of layers to store in VRAM (-1 - use default)
     int32_t main_gpu          = 0;   // the GPU that is used for scratch and small tensors
-    float   tensor_split[128] = {0}; // how split tensors should be distributed across GPUs
+    float   tensor_split[LLAMA_MAX_DEVICES] = {0}; // how split tensors should be distributed across GPUs
+    bool    tensor_split_auto = false; // Flag to indicate if tensor_split was automatically generated
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
 
