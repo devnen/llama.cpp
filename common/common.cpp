@@ -1,3 +1,4 @@
+// common/common.cpp
 #if defined(_MSC_VER)
 #define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
 #endif
@@ -234,7 +235,7 @@ bool set_process_priority(enum ggml_sched_priority prio) {
         case GGML_SCHED_PRIO_REALTIME: p = -20; break;
     }
 
-    if (!setpriority(PRIO_PROCESS, 0, p)) {
+    if (setpriority(PRIO_PROCESS, 0, p) != 0) { // Check return value for POSIX
         LOG_WRN("failed to set process priority %d : %s (%d)\n", prio, strerror(errno), errno);
         return false;
     }
@@ -302,6 +303,11 @@ bool parse_cpu_range(const std::string & range, bool (&boolmask)[GGML_MAX_N_THRE
         }
     }
 
+    if (start_i > end_i) { // Added check for invalid range order
+        LOG_ERR("Start index cannot be greater than end index!\n");
+        return false;
+    }
+
     for (size_t i = start_i; i <= end_i; i++) {
         boolmask[i] = true;
     }
@@ -317,7 +323,9 @@ bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[GGML_MAX_N_THREAD
     }
 
     size_t num_digits = mask.length() - start_i;
-    if (num_digits > 128) num_digits = 128;
+    if (num_digits > GGML_MAX_N_THREADS / 4) { // Adjust max digits based on GGML_MAX_N_THREADS
+        num_digits = GGML_MAX_N_THREADS / 4;
+    }
 
     size_t end_i = num_digits + start_i;
 
@@ -336,14 +344,86 @@ bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[GGML_MAX_N_THREAD
             return false;
         }
 
-        boolmask[  n  ] = boolmask[  n  ] || ((id & 8) != 0);
-        boolmask[n - 1] = boolmask[n - 1] || ((id & 4) != 0);
-        boolmask[n - 2] = boolmask[n - 2] || ((id & 2) != 0);
-        boolmask[n - 3] = boolmask[n - 3] || ((id & 1) != 0);
+        // Ensure we don't write out of bounds
+        if (n < GGML_MAX_N_THREADS)     boolmask[n]     = boolmask[n]     || ((id & 8) != 0);
+        if (n > 0 && n - 1 < GGML_MAX_N_THREADS) boolmask[n - 1] = boolmask[n - 1] || ((id & 4) != 0);
+        if (n > 1 && n - 2 < GGML_MAX_N_THREADS) boolmask[n - 2] = boolmask[n - 2] || ((id & 2) != 0);
+        if (n > 2 && n - 3 < GGML_MAX_N_THREADS) boolmask[n - 3] = boolmask[n - 3] || ((id & 1) != 0);
     }
 
     return true;
 }
+
+// Helper function to parse tensor split string
+// Returns true if parsing was successful, false otherwise
+bool parse_tensor_split(const std::string & ts_str, float tensor_split[LLAMA_MAX_DEVICES]) {
+    // Check for slash notation (layer counts)
+    if (ts_str.find('/') != std::string::npos) {
+        std::vector<std::string> layer_counts_str = string_split(ts_str, '/');
+        if (layer_counts_str.size() > LLAMA_MAX_DEVICES) {
+            LOG_ERR("Too many layer counts specified in tensor split (max %d)\n", LLAMA_MAX_DEVICES);
+            return false;
+        }
+        for (size_t i = 0; i < layer_counts_str.size(); ++i) {
+            try {
+                float count = std::stof(layer_counts_str[i]);
+                if (count < 0) {
+                    LOG_ERR("Invalid negative layer count '%s' in tensor split\n", layer_counts_str[i].c_str());
+                    return false;
+                }
+                // Store layer counts directly. The interpretation happens later.
+                // Use a negative sign to distinguish from proportions.
+                tensor_split[i] = -count;
+            } catch (const std::invalid_argument & e) {
+                LOG_ERR("Invalid layer count '%s' in tensor split: %s\n", layer_counts_str[i].c_str(), e.what());
+                return false;
+            } catch (const std::out_of_range & e) {
+                LOG_ERR("Layer count '%s' out of range in tensor split: %s\n", layer_counts_str[i].c_str(), e.what());
+                return false;
+            }
+        }
+        // Mark the end of layer counts with a special value if needed, or rely on zero initialization.
+        // For simplicity, we rely on the default zero initialization for remaining devices.
+    } else { // Assume comma notation (proportions)
+        std::vector<std::string> ratios_str = string_split(ts_str, ',');
+        if (ratios_str.size() > LLAMA_MAX_DEVICES) {
+            LOG_ERR("Too many ratios specified in tensor split (max %d)\n", LLAMA_MAX_DEVICES);
+            return false;
+        }
+        float sum = 0.0f;
+        for (size_t i = 0; i < ratios_str.size(); ++i) {
+            try {
+                float ratio = std::stof(ratios_str[i]);
+                if (ratio < 0) {
+                    LOG_ERR("Invalid negative ratio '%s' in tensor split\n", ratios_str[i].c_str());
+                    return false;
+                }
+                tensor_split[i] = ratio;
+                sum += ratio;
+            } catch (const std::invalid_argument & e) {
+                LOG_ERR("Invalid ratio '%s' in tensor split: %s\n", ratios_str[i].c_str(), e.what());
+                return false;
+            } catch (const std::out_of_range & e) {
+                LOG_ERR("Ratio '%s' out of range in tensor split: %s\n", ratios_str[i].c_str(), e.what());
+                return false;
+            }
+        }
+        // Normalize proportions
+        if (sum <= 1e-6) { // Avoid division by zero or near-zero
+             LOG_WRN("Sum of tensor split ratios is zero or negative, cannot normalize.\n");
+             // Keep original values or reset to default? Resetting might be safer.
+             std::fill(tensor_split, tensor_split + LLAMA_MAX_DEVICES, 0.0f);
+             return false; // Indicate potential issue
+        }
+        if (sum > 0.0f) {
+            for (size_t i = 0; i < ratios_str.size(); ++i) {
+                tensor_split[i] /= sum;
+            }
+        }
+    }
+    return true;
+}
+
 
 void common_init() {
     llama_log_set([](ggml_log_level level, const char * text, void * /*user_data*/) {
@@ -1064,7 +1144,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
-    mparams.tensor_split    = params.tensor_split;
+    // Only copy tensor_split if it wasn't automatically generated
+    if (!params.tensor_split_auto) {
+        mparams.tensor_split = params.tensor_split;
+    } else {
+        mparams.tensor_split = nullptr; // Signal auto-balancing in llama_model_load
+    }
     mparams.use_mmap        = params.use_mmap;
     mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;
@@ -1132,7 +1217,7 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const cpu_p
     ggml_threadpool_params_init(&tpp, params.n_threads); // setup the defaults
 
     if (params.mask_valid) {
-        std::memcpy(&tpp.cpumask, &params.cpumask, GGML_MAX_N_THREADS);
+        std::memcpy(&tpp.cpumask, ¶ms.cpumask, GGML_MAX_N_THREADS);
     }
 
     tpp.prio       = params.priority;
